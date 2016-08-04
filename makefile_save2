@@ -1,0 +1,49 @@
+MAIN  = SOL_KERNEL2
+FC    = mpiifort
+
+HDF5 = /users/home/opt-intel_2015.3.187/hdf5/hdf5-1.8.15-patch1
+
+NCDF_INC = -I${NETCDF}/include
+NCDF_LIB = -L${NETCDF}/lib -lnetcdff -lnetcdf
+HDF5_INC = -I${HDF5}/include
+HDF5_LIB = -L${HDF5}/lib -lhdf5_hl -lhdf5
+XIOS_INC = -I${XIOS}inc
+XIOS_LIB = -L${XIOS}lib -lxios
+INC_PATH = -I 
+
+FCFLAGS = -r8 -O3 -xHost -fp-model source -traceback -g -warn -check $(NCDF_INC) $(HDF5_INC) $(XIOS_INC)
+LDFLAGS = $(FCFLAGS) $(NCDF_LIB) $(HDF5_LIB) $(XIOS_LIB) -lstdc++ -lz -lgpfs -lcurl  
+
+MAINOBJECTS = par_kind.o par_oce.o dom_oce_mod.o init.o mppini2.o sol_kernel2.o
+
+$(MAIN): $(MAINOBJECTS) 
+	$(FC) *.o -o $(MAIN) $(LDFLAGS)
+
+mppini2.o: mppini2.F90 dom_oce_mod.o in_out_manager.o lib_mpp.o
+	$(FC) -c mppini2.F90
+	
+dom_oce_mod.o: dom_oce_mod.F90 par_oce.o
+	$(FC) -c dom_oce_mod.F90
+
+par_oce.o: par_oce.F90
+	$(FC) -c par_oce.F90
+
+lib_mpp.o: lib_mpp.F90 dom_oce_mod.o lbcnfd.o in_out_manager.o
+	$(FC) -c lib_mpp.F90
+
+in_out_manager.o: in_out_manager.F90 par_oce.o lib_print.o nc4interface.o
+	$(FC) -c in_out_manager.F90
+
+lib_print.o: lib_print.F90 par_kind.o
+	$(FC) -c lib_print.F90  
+
+par_kind.o: par_kind.F90
+	$(FC) -c par_kind.F90
+
+#%.o: %.F90
+#	$(FC) -c $(FCFLAGS) $<
+
+clean:
+	rm *.o *.mod
+
+ 

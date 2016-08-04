@@ -1,0 +1,30 @@
+MAIN  = SOL_KERNEL2
+FC    = mpiifort
+
+HDF5 = /users/home/opt-intel_2015.3.187/hdf5/hdf5-1.8.15-patch1
+
+NCDF_INC = -I${NETCDF}/include
+NCDF_LIB = -L${NETCDF}/lib -lnetcdff -lnetcdf
+HDF5_INC = -I${HDF5}/include
+HDF5_LIB = -L${HDF5}/lib -lhdf5_hl -lhdf5
+XIOS_INC = -I${XIOS}inc
+XIOS_LIB = -L${XIOS}lib -lxios
+INC_PATH = -I 
+
+FCFLAGS = -r8 -O3 -xHost -fp-model source -traceback -g -warn -check $(NCDF_INC) $(HDF5_INC) $(XIOS_INC)
+LDFLAGS = $(FCFLAGS) $(NCDF_LIB) $(HDF5_LIB) $(XIOS_LIB) -lstdc++ -lz -lgpfs -lcurl  
+
+OBJECTS = wrk_nemo.o utils.o sol_kernel2.o 
+
+SOURCES = $(OBJECTS:.o,.F90)
+
+$(MAIN): $(OBJECTS)
+	$(FC) *.o -o $(MAIN) $(LDFLAGS)
+
+%.o: %.F90
+	$(FC) -c $(FCFLAGS) $<
+
+clean:
+	rm *.o *.mod
+
+ 
