@@ -267,6 +267,16 @@ MODULE utils
    INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   nldit , nldjt    !: first, last indoor index for each i-domain
    INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   nleit , nlejt    !: first, last indoor index for each j-domain
    INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:) :: nfiimpp, nfipproc, nfilcit
+   LOGICAL, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   someone_east     ! these structure work only for jperio = 0    
+   LOGICAL, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   someone_west     
+   LOGICAL, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   someone_north     
+   LOGICAL, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   someone_south    
+   INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   nx_west , nx_east  ! grid points along x for neighbouring processes
+   INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   ny_south, ny_north ! grid points along y for neighbouring processes
+   INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   nx_self , ny_self  ! grid alog x and y for each process
+   INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   RB                 ! Rows Before (used to build solver matrix)
+   INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   col_shift_east , col_shift_west  ! (used to build solver matrix)     
+   INTEGER, PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:) ::   col_shift_north, col_shift_south ! (used to build solver matrix)     
 
    !!----------------------------------------------------------------------
    !! horizontal curvilinear coordinate and scale factors
@@ -512,12 +522,15 @@ MODULE utils
    REAL(wp), PUBLIC ::   sigmak
    INTEGER,  PUBLIC ::   nn_sstep 
    INTEGER,  PUBLIC ::   nn_rank_print, rank_print 
+   LOGICAL,  PUBLIC ::   nn_coef_out 
+   !INTEGER,  PUBLIC ::   RB          ! Rows Before (Parameter Used to Build Global Matrix for Petsc) 
 
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:,:) ::   gcp     !: matrix extra-diagonal elements
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcx     !: now    solution of the elliptic eq.
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcxb    !: before solution of the elliptic eq.
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdprc  !: inverse diagonal preconditioning matrix
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdmat  !: diagonal preconditioning matrix
+   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdmat2 !: copy of diagonal preconditioning matrix
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcb     !: second member of the elliptic eq.
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcr     !: residu =b-a.x
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdes   !: vector descente
@@ -767,6 +780,7 @@ MODULE utils
 #  include "vectopt_loop_substitute.h90"
 #  include "domzgr_substitute.h90"
 
+
 CONTAINS
    !! INDEX OF SUBROUTINES AND FUNCTIONS (line numbers are approximative ...)
    !!  çç
@@ -810,7 +824,7 @@ CONTAINS
       !!
       REAL(wp)::   zgcb           ! temporary scalar
       REAL(wp)::   wtime
-      INTEGER ::   ji,jj          ! dummy loop indices
+      INTEGER ::   ji,jj,i          ! dummy loop indices
       !INTEGER ::   ilocal_comm   ! local integer
       INTEGER ::   ios,iost,ierr,code,kindic,inum
       INTEGER ::   sol_alloc_error,oce_alloc_error
@@ -825,7 +839,7 @@ CONTAINS
       NAMELIST/nammpp/ cn_mpi_send, nn_buffer, ln_nnogather, jpni, jpnj, jpnij 
 
       NAMELIST/namsol/ nn_solv, nn_sol_arp, rn_eps, nn_nmin, nn_nmax, nn_nmod, &
-         &             rn_resmax, rn_sor, nn_sstep , nn_rank_print
+         &             rn_resmax, rn_sor, nn_sstep , nn_rank_print, nn_coef_out
       NAMELIST/namgcp/ nn_gcp1, nn_gcp2 , nn_gcp3, nn_gcp4, nn_gcb
       NAMELIST/namdom/ nn_bathy, rn_bathy , rn_e3zps_min, rn_e3zps_rat, nn_msh, rn_hmin,   &
          &             nn_acc   , rn_atfp     , rn_rdt      , rn_rdtmin ,&
@@ -863,6 +877,7 @@ CONTAINS
       CALL mpi_comm_dup( mpi_comm_world, mpi_comm_opa, code)
       CALL mpi_comm_rank( mpi_comm_opa, mpprank, ierr )
       CALL mpi_comm_size( mpi_comm_opa, mppsize, ierr )
+  
       narea = mpprank
       narea = narea + 1 ! <-- this is done in original nemo_init
 
@@ -891,6 +906,7 @@ CONTAINS
 
       CALL mpp_init   
    
+
       !IF ( mpprank == 0 ) PRINT *, 'nldi ',' nlei ',' nldj ',' nlej ',' nlei-nldi+1 ',' nlej-nldj+1'               
       !PRINT '(6i6)', nldi, nlei, nldj,nlej,nlei-nldi+1,nlej-nldj+1               
 
@@ -948,6 +964,7 @@ CONTAINS
       CALL sol_mat( 1 )    ! build gcp, gcdprc, gcdmat            
       !CALL sol_mat( 2 )    ! build gcp, gcdprc, gcdmat            
  
+
       ! Right hand side of the elliptic equation and first guess
       ! --------------------------------------------------------
       DO jj = 2, jpjm1
@@ -1042,6 +1059,8 @@ CONTAINS
          ncut  = 999
       ENDIF
 
+      !CALL neighbours
+
       !    Iterarive solver for the elliptic equation (except IF sol.=0)
       !    (output in gcx with boundary conditions applied)
       CALL MPI_BARRIER(mpi_comm_opa, ierr)
@@ -1049,26 +1068,23 @@ CONTAINS
 
       kindic = 0
       IF( ncut == 0 ) THEN
-         IF    ( nn_solv == 1 ) THEN   
-            IF ( mpprank == rank_print ) PRINT *,' <-using pcg->'
+         IF    ( nn_solv == 1 ) THEN
             CALL sol_pcg( kindic )       ! diagonal preconditioned conjuguate gradient
-         ELSEIF( nn_solv == 2 ) THEN 
-            IF ( mpprank == rank_print ) PRINT *,' <-using sor->'  
+         ELSEIF( nn_solv == 2 ) THEN
             CALL sol_sor( kindic )       ! successive-over-relaxation
-         !ELSEIF( nn_solv == 3 ) THEN   ;   CALL standard_pcg( kindic )   ! diagonal preconditioned standard CG 
-         !ELSEIF( nn_solv == 4 ) THEN   ;   CALL standard_cg2( kindic )  ! diagonal preconditioned standard CG2 
-         ELSEIF( nn_solv == 5 ) THEN 
-            IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using pcg sstep, sstep =',sstep,'->' 
-            CALL sstep_pcg( kindic ) ! PCG with s-step approach 
+         !ELSEIF( nn_solv == 3 )  CALL standard_pcg( kindic )  ! diagonal preconditioned standard CG 
+         !ELSEIF( nn_solv == 4 )  CALL standard_cg2( kindic )  ! diagonal preconditioned standard CG2 
+         ELSEIF( nn_solv == 5 ) THEN
+            CALL sstep_pcg( kindic )     ! PCG with s-step approach 
          ELSEIF( nn_solv == 6 ) THEN
-            IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using MV orig  >' 
             CALL mv_orig                 ! Sequence of Matrix-Vector products with 1/1 frequency of LBC 
          ELSEIF( nn_solv == 7 ) THEN
-            IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using MV sstep ',sstep,' >' 
             CALL mv_sstep                ! Sequence of Matrix-Vector products with 1/s frequecy of LBC
+         ELSEIF( nn_solv == 8 ) THEN
+            CALL sol_petsc               ! using Petsc  
          ENDIF
       ENDIF
-    
+
       CALL MPI_BARRIER( mpi_comm_opa, ierr)   
       IF ( mpprank == rank_print ) PRINT *,'solver time:',MPI_Wtime()-wtime
 
@@ -1116,6 +1132,11 @@ CONTAINS
       ALLOCATE( nimppt(jpnij) , ibonit(jpnij) , nlcit(jpnij) , nlcjt(jpnij) ,     &
          &      njmppt(jpnij) , ibonjt(jpnij) , nldit(jpnij) , nldjt(jpnij) ,     &
          &                                      nleit(jpnij) , nlejt(jpnij) ,     &
+         &      someone_east(jpnij), someone_west(jpnij), someone_north(jpnij), someone_south(jpnij) ,   &
+         &      RB(jpnij) , & 
+         &      nx_west(jpnij) , nx_east(jpnij) , ny_south(jpnij) , ny_north(jpnij) , &
+         &      nx_self(jpnij) , ny_self(jpnij) , &
+         &      col_shift_east(jpj), col_shift_west(jpj), col_shift_north(jpi), col_shift_south(jpi), &
          &      mi0(jpidta)   , mi1 (jpidta),  mj0(jpjdta)   , mj1 (jpjdta),      &
          &      tpol(jpiglo)  , fpol(jpiglo)                               , STAT=ierr(2) )
          !
@@ -1234,8 +1255,8 @@ CONTAINS
       !!   8.5  !  02-08  (G. Madec)  F90 : free form
       !!   3.4  !  11-11  (C. Harris) decomposition changes for running with CICE
       !!----------------------------------------------------------------------
-      INTEGER  ::   ji, jj, jn   ! dummy loop indices
-      INTEGER  ::   ii, ij, ifreq, il1, il2,iost            ! local integers
+      INTEGER  ::   ji, jj, jn ,i  ! dummy loop indices
+      INTEGER  ::   ii, ij, ifreq, il1, il2,iost, sum_RB            ! local integers
       INTEGER  ::   iresti, irestj, ijm1, imil, inum   !   -      -
       REAL(wp) ::   zidom, zjdom                       ! local scalars
       INTEGER, DIMENSION(jpni,jpnj) ::   iimppt, ijmppt, ilcit, ilcjt   ! local workspace
@@ -1418,7 +1439,97 @@ CONTAINS
          nldjt(jn) = nldj
          nlejt(jn) = nlej
       END DO
-      
+
+      !! ------------------------------------------------ !! 
+      !! THESE STRUCTURES WORK ONLY FOR CLOSED BOUNDARIES !!
+      !! they say whether a process has neighbours in     !!
+      !! east, west, north, south direction and how many  !!
+      !! grid points they have in x and y direction       !!
+      !! ------------------------------------------------ !! 
+      DO jn = 1, jpnij
+         IF ( ibonit(jn) == -1 ) THEN
+            someone_east(jn) = .TRUE.
+            someone_west(jn) = .FALSE.
+            nx_west(jn) = 0
+            nx_east(jn) = nleit(jn+1) - nldit(jn+1) + 1
+         ELSE IF ( ibonit(jn) == 0 ) THEN
+            someone_east(jn) = .TRUE.
+            someone_west(jn) = .TRUE.
+            nx_west(jn) = nleit(jn-1) - nldit(jn-1) + 1
+            nx_east(jn) = nleit(jn+1) - nldit(jn+1) + 1
+         ELSE IF ( ibonit(jn) == 1 ) THEN
+            someone_east(jn) = .FALSE.
+            someone_west(jn) = .TRUE.
+            nx_west(jn) = nleit(jn-1) - nldit(jn-1) + 1
+            nx_east(jn) = 0
+         ELSE IF ( ibonit(jn) == 2 ) THEN
+            someone_east(jn) = .FALSE.
+            someone_west(jn) = .FALSE.
+            nx_west(jn) = 0
+            nx_east(jn) = 0
+         END IF
+         IF ( ibonjt(jn) == -1 ) THEN
+            someone_north(jn) = .TRUE.
+            someone_south(jn) = .FALSE.
+            ny_south(jn) = 0
+            ny_north(jn) = nlejt(jn+jpni) - nldjt(jn+jpni) + 1
+         ELSE IF ( ibonjt(jn) == 0 ) THEN
+            someone_north(jn) = .TRUE.
+            someone_south(jn) = .TRUE.
+            ny_south(jn) = nlejt(jn-jpni) - nldjt(jn-jpni) + 1
+            ny_north(jn) = nlejt(jn+jpni) - nldjt(jn+jpni) + 1
+         ELSE IF ( ibonjt(jn) == 1 ) THEN
+            someone_north(jn) = .FALSE.
+            someone_south(jn) = .TRUE.
+            ny_south(jn) = nlejt(jn-jpni) - nldjt(jn-jpni) + 1
+            ny_north(jn) = 0
+         ELSE IF ( ibonjt(jn) == 2 ) THEN
+            someone_north(jn) = .FALSE.
+            someone_south(jn) = .FALSE.
+            ny_south(jn) = 0 
+            ny_north(jn) = 0
+         END IF
+         nx_self(jn) = nleit(jn) - nldit(jn) + 1
+         ny_self(jn) = nlejt(jn) - nldjt(jn) + 1
+      END DO
+
+      !! RB is used later in sol_petsc to build global matrix 
+      RB(:) = 0 
+      IF ( jpnij > 1 ) THEN
+         DO i = 2, jpnij
+            DO jn = 1,i-1
+               RB(i) = RB(i-1) + ( nleit(jn) - nldit(jn) + 1 ) * ( nlejt(jn) - nldjt(jn) + 1 )
+            END DO
+         END DO 
+      END IF 
+
+      !! -------------------------------------------------- !!
+      !! Define col_shift structures to build Solver Matrix !! 
+      !! ---------------------------------------------------!!
+
+      IF ( someone_east(mpprank+1) == .TRUE. ) THEN
+         DO jj = nldjt(mpprank+1), nlejt(mpprank+1)
+            col_shift_east(jj) = (nlejt(mpprank+1)-jj) * nx_self(mpprank+1) + (jj-nldjt(mpprank+1)) * nx_east(mpprank+1) + 1   
+         END DO                          
+      END IF
+
+      IF ( someone_west(mpprank+1) == .TRUE. ) THEN
+         DO jj = nldjt(mpprank+1), nlejt(mpprank+1)
+            col_shift_west(jj) = (jj-nldjt(mpprank+1)) * nx_self(mpprank+1) + (nlejt(mpprank+1)-jj) * nx_west(mpprank+1) + 1   
+         END DO                          
+      END IF
+
+      IF ( someone_south(mpprank+1) == .TRUE. ) THEN
+         DO ji = nldit(mpprank+1), nleit(mpprank+1) 
+            col_shift_south(ji) = (ji - nldit(mpprank+1)) + (RB(mpprank+1) - RB(mpprank+1-jpni+1)) + (nleit(mpprank+1) - ji) + 1
+         END DO
+      END IF
+
+      IF ( someone_north(mpprank+1) == .TRUE. ) THEN
+         DO ji = nldit(mpprank+1), nleit(mpprank+1)
+            col_shift_north(ji) = (nleit(mpprank+1) - ji) + (RB(mpprank+1+jpni) - RB(mpprank+1+1)) + (ji-nldit(mpprank+1)) + 1 
+         END DO
+      END IF
 
       ! 4. From global to local
       ! -----------------------
@@ -1699,6 +1810,7 @@ CONTAINS
 
       ALLOCATE( gcdprc(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     & 
          &      gcdmat(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     & 
+         &      gcdmat2(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,    & 
          &      gcb   (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     &
          &      zgc   (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) , STAT=ierr(2) )
 
@@ -1748,15 +1860,21 @@ CONTAINS
       !!----------------------------------------------------------------------
       INTEGER, INTENT(in) :: kt
       !!
-      INTEGER ::   ji, jj, inum                 ! dummy loop indices
+      INTEGER ::   ji, jj, inum ,i                ! dummy loop indices
       REAL(wp) ::   zcoefs, zcoefw, zcoefe, zcoefn  ! temporary scalars
       REAL(wp) ::   z2dt, zcoef
       REAL(wp) ::   grav  = 9.80665_wp     ! gravity [m/s2]
+      LOGICAL  ::   ln_coef_out 
       !!----------------------------------------------------------------------
       !
       !IF( nn_timing == 1 )  CALL timing_start('sol_mat')
       !
-      
+      ln_coef_out = nn_coef_out
+      IF ( mppsize > 1 ) THEN ! do not print coeffs in file in mpp case   
+         ln_coef_out = .FALSE. 
+      END IF
+
+
       ! 1. Construction of the matrix
       ! -----------------------------
       zcoef = 0.e0                          ! initialize to zero
@@ -1765,8 +1883,9 @@ CONTAINS
       gcp(:,:,3) = 0.e0
       gcp(:,:,4) = 0.e0
       !
-      gcdprc(:,:) = 0.e0
-      gcdmat(:,:) = 0.e0
+      gcdprc(:,:)  = 0.e0
+      gcdmat(:,:)  = 0.e0
+      gcdmat2(:,:) = 1.e0
       !
       IF(  kt == 1 ) THEN   ;   z2dt = rdt
       ELSE                                        ;   z2dt = 2. * rdt
@@ -1780,11 +1899,14 @@ CONTAINS
       4323 FORMAT(i4,1x,i4,1x,f7.1)
       4324 FORMAT(i4,1x,i4,1x,i4)
 
-      OPEN(unit=40, file='Diag' ,status ='replace', action='write')
-      OPEN(unit=41, file='South',status ='replace', action='write')
-      OPEN(unit=42, file='West' ,status ='replace', action='write')
-      OPEN(unit=43, file='East' ,status ='replace', action='write')
-      OPEN(unit=44, file='North',status ='replace', action='write')
+      IF ( ln_coef_out ) THEN
+         OPEN(unit=40 , file='Diag' ,status ='replace', action='write')
+         OPEN(unit=41 , file='South',status ='replace', action='write')
+         OPEN(unit=42 , file='West' ,status ='replace', action='write')
+         OPEN(unit=43 , file='East' ,status ='replace', action='write')
+         OPEN(unit=44 , file='North',status ='replace', action='write')
+         OPEN(unit=140, file='Diag2',status ='replace', action='write')
+      END IF
       !OPEN(unit=45, file='HU'   ,status ='replace', action='write')
       !OPEN(unit=46, file='HV'   ,status ='replace', action='write')
       !OPEN(unit=47, file='e1u'  ,status ='replace', action='write')
@@ -1822,8 +1944,14 @@ CONTAINS
             !WRITE(6,*) 'zcoef', zcoef
             !WRITE(6,*) 'grav', grav
             !END IF
-            gcdmat(ji,jj) = e1t(ji,jj) * e2t(ji,jj) * bmask(ji,jj)    &          ! diagonal coefficient
+            gcdmat(ji,jj)  = e1t(ji,jj) * e2t(ji,jj) * bmask(ji,jj)    &          ! diagonal coefficient
                &          - zcoefs -zcoefw -zcoefe -zcoefn
+            IF ( bmask(ji,jj) == 0 ) THEN
+               gcdmat2(ji,jj) = 1.0e0
+            ELSE
+               gcdmat2(ji,jj) = e1t(ji,jj) * e2t(ji,jj) * bmask(ji,jj)    &          ! diagonal coefficient
+                  &          - zcoefs -zcoefw -zcoefe -zcoefn
+            END IF
             !gcdmat(ji,jj) = 1.e0 !e1t(ji,jj) * e2t(ji,jj) * bmask(ji,jj)    &          ! diagonal coefficient
                !IF ( ji == 1 .and. jj == 57 ) THEN
                !WRITE(6,*) ji,jj
@@ -1836,11 +1964,14 @@ CONTAINS
                !WRITE(6,*) 'gcp(',ji,',',jj,',1)=', gcp(ji,jj,1)
                !END IF
             ! write coeffs to file
-            WRITE(40,4321) ji,jj, gcdmat(ji,jj)
-            WRITE(41,4321) ji,jj, gcp(ji,jj,1)
-            WRITE(42,4321) ji,jj, gcp(ji,jj,2)
-            WRITE(43,4321) ji,jj, gcp(ji,jj,3)
-            WRITE(44,4321) ji,jj, gcp(ji,jj,4)
+            IF ( ln_coef_out ) THEN
+               WRITE(40 ,4321) ji,jj, gcdmat(ji,jj)
+               WRITE(41 ,4321) ji,jj, gcp(ji,jj,1)
+               WRITE(42 ,4321) ji,jj, gcp(ji,jj,2)
+               WRITE(43 ,4321) ji,jj, gcp(ji,jj,3)
+               WRITE(44 ,4321) ji,jj, gcp(ji,jj,4)
+               WRITE(140,4321) ji,jj, gcdmat2(ji,jj)
+            END IF
             !WRITE(45,4322) ji,jj, hv(ji,jj-1) , hv(ji,jj)
             !WRITE(46,4322) ji,jj, hu(ji-1,jj) , hu(ji,jj)
             !WRITE(47,4322) ji,jj, e1u(ji-1,jj), e1u(ji,jj)
@@ -1856,11 +1987,14 @@ CONTAINS
          END DO
       END DO
 
-      CLOSE(40)
-      CLOSE(41)
-      CLOSE(42)
-      CLOSE(43)
-      CLOSE(44)
+      IF ( ln_coef_out ) THEN
+         CLOSE(40)
+         CLOSE(41)
+         CLOSE(42)
+         CLOSE(43)
+         CLOSE(44)
+         CLOSE(140)
+      END IF
       !CLOSE(45)
       !CLOSE(46)
       !CLOSE(47)
@@ -1880,7 +2014,7 @@ CONTAINS
       !WRITE(6,*) 'gcdmat(',2,',',58,')', gcdmat(2,58)
       !WRITE(6,*) 'gcdmat(',3,',',58,')', gcdmat(3,58)
 
-      IF (.TRUE.) THEN 
+      IF ( ln_coef_out ) THEN 
          CALL iom_open('coeffs',inum,.TRUE.)
          CALL iom_rp2d(1,1,inum,'aD',gcdmat(2:jpim1,2:jpjm1))
          CALL iom_rp2d(1,1,inum,'aS',gcp(2:jpim1,2:jpjm1,1))
@@ -1892,18 +2026,18 @@ CONTAINS
 
       ! check symmetry before preconditioning
       ! only different values are printed
-      DO ji = 2, jpim1
-        DO jj = 2, jpjm1
-          IF (.NOT. gcp(ji-1,jj,3) == gcp(ji,jj,2)   ) THEN
-          !gcp(ji,jj,2) = gcp(ji-1,jj,3)   ! Attenzione!!!
-          WRITE(6,1234) ' E(',ji-1,',', jj,')= ',  gcp(ji-1,jj,3) ,' W(',ji,',',jj  ,')= ', gcp(ji,jj  ,2) 
-          END IF
-          IF (.NOT. gcp(ji,jj-1,4) == gcp(ji,jj,1)  ) THEN
-          !gcp(ji,jj,1) = gcp(ji,jj-1,4)   ! Attenzione!!!
-          WRITE(6,1234) ' N(',ji,',', jj-1,')= ',  gcp(ji,jj-1,4) ,' S(',ji  ,',',jj,')= ', gcp(ji  ,jj,1) 
-          END IF
-        END DO
-      END DO      
+      !DO ji = 2, jpim1
+      !  DO jj = 2, jpjm1
+      !    IF (.NOT. gcp(ji-1,jj,3) == gcp(ji,jj,2)   ) THEN
+      !    !gcp(ji,jj,2) = gcp(ji-1,jj,3)   ! Attenzione!!!
+      !    WRITE(6,1234) ' E(',ji-1,',', jj,')= ',  gcp(ji-1,jj,3) ,' W(',ji,',',jj  ,')= ', gcp(ji,jj  ,2) 
+      !    END IF
+      !    IF (.NOT. gcp(ji,jj-1,4) == gcp(ji,jj,1)  ) THEN
+      !    !gcp(ji,jj,1) = gcp(ji,jj-1,4)   ! Attenzione!!!
+      !    WRITE(6,1234) ' N(',ji,',', jj-1,')= ',  gcp(ji,jj-1,4) ,' S(',ji  ,',',jj,')= ', gcp(ji  ,jj,1) 
+      !    END IF
+      !  END DO
+      !END DO      
       !IF ( mpprank == 0 ) PRINT *, gcp(:,:,1)
       !IF ( mpprank == 0 ) PRINT *, gcdmat
       
@@ -4379,6 +4513,7 @@ CONTAINS
       zgcr = 0._wp
       gcr  = 0._wp
 
+      IF ( mpprank == rank_print ) PRINT *,' <-using pcg->'
       !CALL lbc_lnk( gcx, c_solver_pt, 1. )   ! lateral boundary condition
       CALL mpp_lnk_2d( gcx, c_solver_pt, 1. )   ! lateral boundary condition
 
@@ -4691,7 +4826,7 @@ CONTAINS
          !IF ( mpprank == rank_print ) PRINT '(a,i3,a,e17.11,a,e14.8)','pcg iter',jn,' local_rnorme   ',local_rnorme
          !IF ( mpprank == rank_print ) PRINT '(a,i3,a,e17.11,a,e14.8)','pcg iter',jn,' local_zgcad    ',local_zgcad
 
-         222 FORMAT(2a,e13.7,1x,a,4(e13.7,1x),a,e13.7,1x,a)
+         222 FORMAT(2a,e13.6,1x,a,4(e13.6,1x),a,e13.6,1x,a)
          IF (.TRUE.) THEN
          IF ( mpprank == rank_print ) THEN
             PRINT*,'_____________________________________________________'
@@ -4873,6 +5008,7 @@ CONTAINS
       !!----------------------------------------------------------------------
       !
       !IF( nn_timing == 1 )  CALL timing_start('sol_sor')
+      IF ( mpprank == rank_print ) PRINT *,' <-using sor->'  
       !
       CALL wrk_alloc( jpi, jpj, ztab )
       !
@@ -6434,7 +6570,6 @@ CONTAINS
       !!----------------------------------------------------------------------
       !
       !IF( nn_timing == 1 )  CALL timing_start('zgr_z')
-      WRITE(6,*) 'calling zgr_z'
       !
       ! Set variables from parameters
       ! ------------------------------
@@ -6447,7 +6582,7 @@ CONTAINS
       IF(   ppa1  == pp_to_be_computed  .AND.  &
          &  ppa0  == pp_to_be_computed  .AND.  &
          &  ppsur == pp_to_be_computed           ) THEN
-         WRITE(6,*) 'option 1'
+         !WRITE(6,*) 'option 1'
          !
 #if defined key_agrif
          za1  = (  ppdzmin - pphmax / FLOAT(jpkdta-1)  )                                                   &
@@ -6461,12 +6596,12 @@ CONTAINS
          za0  = ppdzmin - za1 *              TANH( (1-ppkth) / ppacr )
          zsur =   - za0 - za1 * ppacr * LOG( COSH( (1-ppkth) / ppacr )  )
       ELSE
-         WRITE(6,*) 'option 2'
+         !WRITE(6,*) 'option 2'
          za1 = ppa1 ;       za0 = ppa0 ;          zsur = ppsur
          za2 = ppa2                            ! optional (ldbletanh=T) double tanh parameter
       ENDIF
  
-      WRITE(6,*) 'za1 ', za1, ' za2 ', za2
+      !WRITE(6,*) 'za1 ', za1, ' za2 ', za2
 
       IF(lwp) THEN                         ! Parameter print
          WRITE(numout,*)
@@ -6579,10 +6714,10 @@ CONTAINS
       !
       !IF( nn_timing == 1 )  CALL timing_stop('zgr_z')
       !
-      WRITE(6,*) 'gdepw_1d' 
-      WRITE(6,*) gdepw_1d(:)
-      WRITE(6,*) 'e3t_1d' 
-      WRITE(6,*) e3t_1d(:)
+      !WRITE(6,*) 'gdepw_1d' 
+      !WRITE(6,*) gdepw_1d(:)
+      !WRITE(6,*) 'e3t_1d' 
+      !WRITE(6,*) e3t_1d(:)
 
    END SUBROUTINE zgr_z
 
@@ -6628,7 +6763,7 @@ CONTAINS
       !!----------------------------------------------------------------------
       !
       !IF( nn_timing == 1 )  CALL timing_start('zgr_bat')
-      WRITE(6,*) 'calling zgr_bat'
+      !WRITE(6,*) 'calling zgr_bat'
       !
       IF(lwp) WRITE(numout,*)
       IF(lwp) WRITE(numout,*) '    zgr_bat : defines level and meter bathymetry'
@@ -6731,7 +6866,7 @@ CONTAINS
       ELSEIF( ntopo == 1 ) THEN                       !   read in file   ! (over the local domain)
          !                                            ! ================ !
          !
-         WRITE(6,*) 'ntopo = 1'
+         !WRITE(6,*) 'ntopo = 1'
          IF( ln_zco )   THEN                          ! zco : read level bathymetry 
             CALL iom_open ( 'bathy_level.nc', inum )  
             !CALL iom_get  ( inum, jpdom_data, 'Bathy_level', bathy )
@@ -6767,7 +6902,7 @@ CONTAINS
             !
          ENDIF
          IF( ln_zps .OR. ln_sco )   THEN              ! zps or sco : read meter bathymetry
-            WRITE(6,*) 'reading bathy_meter file'
+            !WRITE(6,*) 'reading bathy_meter file'
             CALL iom_open ( 'bathy_meter.nc', inum ) 
             IF ( ln_isfcav ) THEN
                !CALL iom_get  ( inum, jpdom_data, 'Bathymetry_isf', bathy, lrowattr=.false. )
@@ -6835,10 +6970,10 @@ CONTAINS
          IF( rn_hmin < 0._wp ) THEN    ;   ik = - INT( rn_hmin )                                      ! from a nb of level
          ELSE                          ;   ik = MINLOC( gdepw_1d, mask = gdepw_1d > rn_hmin, dim = 1 )  ! from a depth
          ENDIF
-         WRITE(6,*) 'rn_hmin ', rn_hmin
-         WRITE(6,*) 'ik for gdepw_1d ', ik
+         !WRITE(6,*) 'rn_hmin ', rn_hmin
+         !WRITE(6,*) 'ik for gdepw_1d ', ik
          zhmin = gdepw_1d(ik+1)                                                         ! minimum depth = ik+1 w-levels 
-         WRITE(6,*) 'zhmin ', zhmin
+         !WRITE(6,*) 'zhmin ', zhmin
          WHERE( bathy(:,:) <= 0._wp )   ;   bathy(:,:) = 0._wp                         ! min=0     over the lands
          ELSE WHERE                     ;   bathy(:,:) = MAX(  zhmin , bathy(:,:)  )   ! min=zhmin over the oceans
          END WHERE
@@ -6910,7 +7045,7 @@ CONTAINS
       !
       CALL wrk_alloc( jpi, jpj, jpk, zprt )
       !
-      WRITE(6,*) 'calling zgr_zps'
+      !WRITE(6,*) 'calling zgr_zps'
       IF(lwp) WRITE(numout,*)
       IF(lwp) WRITE(numout,*) '    zgr_zps : z-coordinate with partial steps'
       IF(lwp) WRITE(numout,*) '    ~~~~~~~ '
@@ -6932,16 +7067,16 @@ CONTAINS
       ELSE WHERE                     ;   mbathy(:,:) = jpkm1   ! ocean : initialize mbathy to the max ocean level
       END WHERE
 
-      OPEN(unit=80, file='mbathy_init_jpkm1' ,status ='replace', action='write')
-      WRITE(80,*) mbathy(:,:)
-      CLOSE(80)
+      !OPEN(unit=80, file='mbathy_init_jpkm1' ,status ='replace', action='write')
+      !WRITE(80,*) mbathy(:,:)
+      !CLOSE(80)
 
-      WRITE(6,*) 'zmax = ', zmax
+      !WRITE(6,*) 'zmax = ', zmax
 
       e3zps_min = rn_e3zps_min
       e3zps_rat = rn_e3zps_rat
 
-      OPEN(unit=82, file='zdepth' ,status ='replace', action='write')
+      !OPEN(unit=82, file='zdepth' ,status ='replace', action='write')
         
       ! Compute mbathy for ocean points (i.e. the number of ocean levels)
       ! find the number of ocean levels such that the last level thickness
@@ -6949,15 +7084,15 @@ CONTAINS
       ! e3t_1d is the reference level thickness
       DO jk = jpkm1, 1, -1
          zdepth = gdepw_1d(jk) + MIN( e3zps_min, e3t_1d(jk)*e3zps_rat )
-         WRITE(82,*) gdepw_1d(jk),  e3zps_min, e3t_1d(jk),e3zps_rat 
+         !WRITE(82,*) gdepw_1d(jk),  e3zps_min, e3t_1d(jk),e3zps_rat 
          WHERE( 0._wp < bathy(:,:) .AND. bathy(:,:) <= zdepth )   mbathy(:,:) = jk-1
       END DO
 
-      CLOSE(82)
+      !CLOSE(82)
 
-      OPEN(unit=81, file='mbathy_after_zdepth' ,status ='replace', action='write')
-      WRITE(81,*) mbathy(:,:)
-      CLOSE(81)
+      !OPEN(unit=81, file='mbathy_after_zdepth' ,status ='replace', action='write')
+      !WRITE(81,*) mbathy(:,:)
+      !CLOSE(81)
 
       !IF ( ln_isfcav ) CALL zgr_isf
 
@@ -7688,13 +7823,13 @@ CONTAINS
       IF( nperio == 5 .OR. nperio == 6 ) THEN   ! F-pt pivot and T-pt elliptic eq. : bmask set to 0. on row jpj
          bmask(:,jpj) = 0._wp
       ENDIF
-      WRITE(6,*) 'npolj ', npolj
-      WRITE(6,*) 'nbondi ', nbondi
-      WRITE(6,*) 'nbondj ', nbondj
-      WRITE(6,*) 'jpreci ', jpreci
-      WRITE(6,*) 'jprecj ', jprecj
-      WRITE(6,*) 'nlci   ', nlci
-      WRITE(6,*) 'nlcj   ', nlcj
+      !WRITE(6,*) 'npolj ', npolj
+      !WRITE(6,*) 'nbondi ', nbondi
+      !WRITE(6,*) 'nbondj ', nbondj
+      !WRITE(6,*) 'jpreci ', jpreci
+      !WRITE(6,*) 'jprecj ', jprecj
+      !WRITE(6,*) 'nlci   ', nlci
+      !WRITE(6,*) 'nlcj   ', nlcj
       !
       IF( lk_mpp ) THEN                    ! mpp specificities
          !                                      ! bmask is set to zero on the overlap region
@@ -7959,9 +8094,11 @@ CONTAINS
  
       lbccalls = 0
 
+      IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using MV orig  >' 
+
       yy = 15
-      226 FORMAT(2a,e13.7,1x,a,4(e13.7,1x),a,e13.7,1x,a)
-      227 FORMAT(a,i4,2a,e13.7,1x,a,4(e13.7,1x),a,e13.7,1x,a)
+      226 FORMAT(2a,e13.6,1x,a,4(e13.6,1x),a,e13.6,1x,a)
+      227 FORMAT(a,i4,2a,e13.6,1x,a,4(e13.6,1x),a,e13.6,1x,a)
 
 
       IF (.FALSE.) THEN
@@ -8063,9 +8200,11 @@ CONTAINS
 
       lbccalls = 0 
 
+      IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using MV sstep ',sstep,' >' 
+
       yy = 15
-      225 FORMAT(a,2(e13.7,1x),a,4(e13.7,1x),a,2(e13.7,1x))
-      228 FORMAT(a,i4,a,2(e13.7,1x),a,4(e13.7,1x),a,2(e13.7,1x))
+      225 FORMAT(a,2(e13.6,1x),a,4(e13.6,1x),a,2(e13.6,1x))
+      228 FORMAT(a,i4,a,2(e13.6,1x),a,4(e13.6,1x),a,2(e13.6,1x))
 
       IF ( .FALSE. ) THEN
       IF ( mpprank == rank_print ) THEN
@@ -8165,49 +8304,267 @@ CONTAINS
 
    SUBROUTINE sstep_pcg( kindic)
       INTEGER :: kindic
+      IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using pcg sstep, sstep =',sstep,'->' 
    END SUBROUTINE sstep_pcg   
 
    SUBROUTINE sol_petsc
+      IMPLICIT NONE
 
-#include "petsc/finclude/petscsys.h"
-#include "petsc/finclude/petscvec.h"
-#include "petsc/finclude/petscmat.h"
-#include "petsc/finclude/petscksp.h"
-#include "petsc/finclude/petscpc.h"
-#include "petsc/finclude/petscviewer.h"
+#     include "petsc/finclude/petscsys.h"
+#     include "petsc/finclude/petscvec.h"
+#     include "petsc/finclude/petscmat.h"
+#     include "petsc/finclude/petscksp.h"
+#     include "petsc/finclude/petscpc.h"
+#     include "petsc/finclude/petscviewer.h"
 
       PetscInt         vecsize,nnz, matnnz, vecnnz, N
       PetscInt         matrows, matcols, vecrows, veccols
-      PetscInt         i,its,five, xsize, m
+      PetscInt         i,its,five, xsize, m, one, col_shift
+      PetscInt         ji,jj, ishift, jshift, nx, ny
+      PetscInt         cole, colw, coln, cols
+      PetscInt         LI, col5(5), col4(4), col3(3), row
+      PetscInt         nx_east , nx_west 
+      PetscInt         ny_south, ny_north 
       PetscErrorCode   ierr
       PetscBool        flg, print_out
-      PetscScalar      dot,ione
+      PetscScalar      dot,ione, values5(5), values4(4), values3(3)
       PetscReal        norm,rdot, zero, tol, minus_one
       Vec              x,b,y
       Mat              A
       KSP              ksp
       PC               pc
       PetscMPIInt      rank, comm_size
-      PetscViewer      view
+      PetscViewer      mview  ! DO NOT USE matview. IT LOOKS 
+                              ! LIKE IS A PRIVATE PETSC WORD
+
+
+      CALL PetscInitialize( PETSC_NULL_CHARACTER ,ierr)
+      !CALL mpi_comm_rank( mpi_comm_opa, mpprank, ierr )
+      !CALL mpi_comm_size( mpi_comm_opa, mppsize, ierr )
+
+      five  = 5
+      four  = 4
+      three = 3
+      one   = 1
+
+      IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using sol_petsc  >' 
 
       ! global dimension of matrix
       N = jpiglo * jpjglo 
       ! # of local rows of matrix
-      m = (nlei - nldi + 1)*(nlej - nldj + 1)
+      nx = nlei - nldi + 1
+      ny = nlej - nldj + 1
 
-      CALL PetscInitialize(PETSC_NULL_CHARACTER,ierr)
-      CALL mpi_comm_rank( mpi_comm_opa, mpprank, ierr )
-      CALL mpi_comm_size( mpi_comm_opa, mppsize, ierr )
+      m = nx * ny
+
+      WRITE(6,*) 'N (Matrix Dimension         ) ', N
+      WRITE(6,*) 'm (# of local rows of Matrix) ', m
+      WRITE(6,*) 'local nx                      ', nx
+      WRITE(6,*) 'local ny                      ', ny
+
+      ishift = nldi - 1
+      jshift = nldj - 1
 
       CALL MatCreate( mpi_comm_opa,A,ierr)
-      CALL MatSetSizes(A,m,PETSC_DECIDE,N,N,ierr)
-      CALL MatSetType(A, MATAIJ,ierr)
+      CALL MatSetSizes(A,m,m,N,N,ierr)
+      !CALL MatSetSizes(A,PETSC_DECIDE,PETSC_DECIDE,N,N,ierr)
+      CALL MatSetType(A, MATMPIAIJ,ierr)
       CALL MatSetFromOptions(A,ierr)
       CALL MatMPIAIJSetPreallocation(A,five,PETSC_NULL_INTEGER,five,PETSC_NULL_INTEGER,ierr)
 
+      !CALL MatGetSize     (A, glob_r, glob_c, ierr)
+      !CALL MatGetLocalSize(A, loc_r, loc_c, ierr)
+
+      ! BORDERS ARE TREATED LATER
+      DO jj = nldj+1, nlej-1
+         DO ji = nldi+1, nlei-1
+            LI = (jj-1-jshift)*nx + ji-ishift
+            row = RB(mpprank+1) + LI - 1
+            col5(1)    = row - nx      ! south
+            values5(1) = gcp(ji,jj,1)     
+            col5(2)    = row - 1       ! west
+            values5(2) = gcp(ji,jj,2) 
+            col5(3)    = row           ! diag
+            values5(3) = gcdmat2(ji,jj) 
+            col5(4)    = row + 1       ! east
+            values5(4) = gcp(ji,jj,3) 
+            col5(5)    = row + nx      ! north
+            values5(5) = gcp(ji,jj,4) 
+            !WRITE(6,*) ji,jj, col(:)
+            !CALL MatSetValue(A,RB+LI-1,RB+LI-1, gcdmat2(ji,jj), INSERT_VALUES, ierr) 
+            CALL MatSetValues(A,one,row,five,col, values, INSERT_VALUES, ierr) 
+         END DO
+      END DO
+
+      ! TREATING BORDERS ( WITHOUT CORNERS )
+      ! < EAST BORDER >
+      IF ( someone_east(mpprank+1) == .TRUE. ) THEN
+         ji = nlei ! eastern col
+         DO jj = nldj+1,nlej-1
+            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            col5(1)    = row - nx                       ! south
+            values5(1) = gcp(ji,jj,1)     
+            col5(2)    = row - 1                        ! west
+            values5(2) = gcp(ji,jj,2) 
+            col5(3)    = row                            ! diag
+            values5(3) = gcdmat2(ji,jj) 
+            col5(4)    = row + col_shift_east(jj)       ! east
+            values5(4) = gcp(ji,jj,3) 
+            col5(5)    = row + nx                       ! north
+            values5(5) = gcp(ji,jj,4) 
+            !CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+         END DO
+      ELSE
+         DO jj = nldj+1,nlej-1
+            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            col4(1)    = row - nx                       ! south
+            values4(1) = gcp(ji,jj,1)     
+            col4(2)    = row - 1                        ! west
+            values4(2) = gcp(ji,jj,2) 
+            col4(3)    = row                            ! diag
+            values4(3) = gcdmat2(ji,jj) 
+            col4(4)    = row + nx                       ! north
+            values4(4) = gcp(ji,jj,4) 
+            !CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+         END DO  
+      END IF
+
+      ! < WEST BORDER >
+      IF ( someone_west(mpprank+1) == .TRUE. ) THEN
+         ji = nldi ! western col
+         DO jj = nldj+1,nlej-1
+            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            colw = row - col_shift_west(jj)
+            !WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'west_point',RB(mpprank+1)+LI-col_shift_west(jj) 
+            CALL MatSetValue(A,row,colw, gcp(ji,jj,2), INSERT_VALUES, ierr) 
+         END DO  
+      END IF
+ 
+      ! < NORTH BORDER >
+      IF ( someone_north(mpprank+1) == .TRUE. ) THEN
+         jj = nlej ! northern row
+         DO ji = nldi+1, nlei-1
+            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            coln = row + col_shift_north(ji)
+            !WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'north_point', RB(mpprank+1)+LI+col_shift_north(ji) 
+            CALL MatSetValue(A,row,coln, gcp(ji,jj,4), INSERT_VALUES, ierr) 
+         END DO
+      END IF
+
+      ! < SOUTH BORDER >
+      IF ( someone_south(mpprank+1) == .TRUE. ) THEN
+         jj = nldj ! southern row
+         DO ji = nldi+1, nlei-1
+            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            cols = row - col_shift_south(ji)
+            !WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'south_point', RB(mpprank+1)+LI-col_shift_south(ji) 
+            CALL MatSetValue(A,row,cols, gcp(ji,jj,1), INSERT_VALUES, ierr) 
+         END DO
+      END IF
+
+      ! TREATING CORNERS
+
+      CALL MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr)
+      CALL MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr)
+
+      CALL PetscViewerASCIIOpen( mpi_comm_opa ,'ORCA2_MAT',mview,ierr)
+      CALL MatView(A,mview,ierr)
+      CALL PetscViewerDestroy(mview,ierr)
+
+      CALL MatDestroy(A,ierr)
       CALL PetscFinalize(ierr)
 
    END SUBROUTINE sol_petsc
 
+   SUBROUTINE neighbours
+      IMPLICIT NONE
+
+      INTEGER :: ishift, jshift
+      INTEGER :: ji, jj, i, nx, ny
+      INTEGER :: LI, jn
+      INTEGER :: col_shift
+
+      ishift = nldi - 1
+      jshift = nldj - 1
+
+      nx = nlei - nldi + 1
+      ny = nlej - nldj + 1
+
+      !WRITE(6,*) 'noea ', noea 
+      !WRITE(6,*) 'nowe ', nowe
+      !WRITE(6,*) 'noso ', noso 
+      !WRITE(6,*) 'nono ', nono 
+
+      !WRITE(6,*) 'ROWS BEFORE', RB
+
+      !DO jj = nldj, nlej
+      !   DO ji = nldi, nlei
+      !      LI = (jj-1-jshift)*nx + ji-ishift
+      !      WRITE(6,*) ji,jj, RB + LI
+      !   END DO
+      !END DO
+
+      !WRITE(6,*) 'ibonit       ', ibonit(mpprank+1)       , ' ibonjt        ',ibonjt(mpprank+1)
+      !WRITE(6,*) 'someone_west ', someone_west(mpprank+1) , ' someone_east  ', someone_east(mpprank+1)
+      !WRITE(6,*) 'nx_west      ', nx_west(mpprank+1)      , ' nx_east       ', nx_east(mpprank+1)     
+      !WRITE(6,*) 'someone_south', someone_south(mpprank+1), ' someone_north ',someone_north(mpprank+1)
+      !WRITE(6,*) 'ny_south     ', ny_south(mpprank+1)     , ' ny_north      ', ny_north(mpprank+1)     
+
+      ! TREATING BORDERS
+      IF ( someone_east(mpprank+1) == .TRUE. ) THEN
+         ji = nlei ! eastern col
+         DO jj = nldj,nlej
+            LI = (jj-1-jshift)*nx + ji-ishift
+            WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'east_point',RB(mpprank+1)+LI+col_shift_east(jj) 
+         END DO  
+      END IF
+
+      IF ( someone_west(mpprank+1) == .TRUE. ) THEN
+         ji = nldi ! western col
+         DO jj = nldj,nlej
+            LI = (jj-1-jshift)*nx + ji-ishift
+            WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'west_point',RB(mpprank+1)+LI-col_shift_west(jj) 
+         END DO  
+      END IF
+ 
+      IF ( someone_north(mpprank+1) == .TRUE. ) THEN
+         jj = nlej ! northern row
+         DO ji = nldi, nlei
+            LI = (jj-1-jshift)*nx + ji-ishift
+            WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'north_point', RB(mpprank+1)+LI+col_shift_north(ji) 
+         END DO
+      END IF
+
+      IF ( someone_south(mpprank+1) == .TRUE. ) THEN
+         jj = nldj ! southern row
+         DO ji = nldi, nlei
+            LI = (jj-1-jshift)*nx + ji-ishift
+            WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'south_point', RB(mpprank+1)+LI-col_shift_south(ji) 
+         END DO
+      END IF
+   
+      !ji = nldi
+      !jj = nldj
+      !LI = (jj-1-jshift)*nx + ji-ishift
+      !WRITE(6,*) ji,jj, RB(mpprank+1)+LI
+      !ji = nlei
+      !jj = nldj
+      !LI = (jj-1-jshift)*nx + ji-ishift
+      !WRITE(6,*) ji,jj, RB(mpprank+1)+LI
+      !ji = nldi
+      !jj = nlej
+      !LI = (jj-1-jshift)*nx + ji-ishift
+      !WRITE(6,*) ji,jj, RB(mpprank+1)+LI
+      !ji = nlei
+      !jj = nlej
+      !LI = (jj-1-jshift)*nx + ji-ishift
+      !WRITE(6,*) ji,jj, RB(mpprank+1)+LI
+
+   END SUBROUTINE neighbours
 
 END MODULE utils
