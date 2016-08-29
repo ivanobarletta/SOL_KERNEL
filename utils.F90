@@ -530,7 +530,6 @@ MODULE utils
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcxb    !: before solution of the elliptic eq.
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdprc  !: inverse diagonal preconditioning matrix
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdmat  !: diagonal preconditioning matrix
-   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdmat2 !: copy of diagonal preconditioning matrix
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcb     !: second member of the elliptic eq.
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcr     !: residu =b-a.x
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdes   !: vector descente
@@ -540,6 +539,12 @@ MODULE utils
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:,:) ::   paus    !: ausiliary array to calculate matrix powers
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   zgc     !: ausiliary array to calculate matrix powers
    REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:)     ::   ggg,aaa !: coefficients for sstep solver
+   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcx_pet !: solution of the elliptic eq. with petsc
+   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcdmat2 !: copy of diagonal preconditioning matrix
+   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcb2    !: copy of second member of the elliptic eq.
+   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:)   ::   gcr2    !: copy of residual =b-a.x
+   REAL(wp), PUBLIC, ALLOCATABLE, SAVE, DIMENSION(:,:,:) ::   gcp2    !: copy of matrix extra-diagonal elements
+                                                                      !: used for Petsc
 
 #if defined key_agrif
       REAL(wp), ALLOCATABLE, SAVE, DIMENSION(:,:) :: laplacu, laplacv
@@ -972,9 +977,9 @@ CONTAINS
             ! Divergence of the after vertically averaged velocity
             zgcb =  spgu(ji,jj) - spgu(ji-1,jj)   &
                   + spgv(ji,jj) - spgv(ji,jj-1)
-            !gcb(ji,jj) = bmask(ji,jj) * gcdprc(ji,jj) * zgcb
-            ! comment line with gcdprc to avoid preconditioning
-            gcb(ji,jj) = bmask(ji,jj) * zgcb
+            gcb(ji,jj) = bmask(ji,jj) * gcdprc(ji,jj) * zgcb
+            ! gcb2 is used for Petsc (not preconditioned a priori )
+            gcb2(ji,jj) = bmask(ji,jj) * zgcb
             ! First guess of the after barotropic transport divergence
             gcx (ji,jj) = 0.e0
             gcxb(ji,jj) = 0.e0
@@ -1009,11 +1014,11 @@ CONTAINS
       ! ------------------
       ! original indexes (1:jpi,1:jpj) (dynspg_flt.F90)
       rnorme =0.e0
-      !rnorme = glob_sum_2d( gcb(1:jpi,1:jpj) * gcdmat(1:jpi,1:jpj) * gcb(1:jpi,1:jpj) * bmask(1:jpi,1:jpj) )
-      rnorme = glob_sum_2d( gcb(2:jpim1,2:jpjm1) * gcdmat(2:jpim1,2:jpjm1) & 
-                        & * gcb(2:jpim1,2:jpjm1)  * bmask(2:jpim1,2:jpjm1) )
+      rnorme = glob_sum_2d( gcb(1:jpi,1:jpj) * gcdmat(1:jpi,1:jpj) * gcb(1:jpi,1:jpj) * bmask(1:jpi,1:jpj) )
 
       rank_print = nn_rank_print
+
+      IF ( mpprank == 0 ) WRITE(6,*) 'rnorme: ', rnorme
 
       IF (.FALSE.) THEN
       IF (.TRUE.) THEN
@@ -1090,22 +1095,42 @@ CONTAINS
 
       ! save solution to netCDF
      
-      IF (.TRUE.) THEN 
-         CALL iom_open('sol_out',inum,.TRUE.)
-         CALL iom_rp2d(1,1,inum,'rhs',gcb(:,:))
-         CALL iom_rp2d(1,1,inum,'aD',gcdmat(:,:))
-         CALL iom_rp2d(1,1,inum,'aS',gcp(:,:,1))
-         CALL iom_rp2d(1,1,inum,'aW',gcp(:,:,2))
-         CALL iom_rp2d(1,1,inum,'aE',gcp(:,:,3))
-         CALL iom_rp2d(1,1,inum,'aN',gcp(:,:,4))
-         CALL iom_rp2d(1,1,inum,'hu',hu(:,:))
-         CALL iom_rp2d(1,1,inum,'hv',hv(:,:))
-         CALL iom_rp2d(1,1,inum,'spgu',spgu(:,:))
-         CALL iom_rp2d(1,1,inum,'spgv',spgv(:,:))
-         CALL iom_rp2d(1,1,inum,'mask',bmask(:,:))
-         CALL iom_rp2d(1,1,inum,'x',gcx(:,:))
-         CALL iom_rp2d(1,1,inum,'residual',gcr(:,:))
-         CALL iom_close(inum)
+      IF (.TRUE.) THEN
+         IF ( nn_solv .ne. 8 ) THEN 
+            ! OTHER SOLVER THAN Petsc 
+            CALL iom_open('sol_out',inum,.TRUE.)
+            CALL iom_rp2d(1,1,inum,'rhs',gcb(:,:))
+            CALL iom_rp2d(1,1,inum,'aD',gcdmat(:,:))
+            CALL iom_rp2d(1,1,inum,'aS',gcp(:,:,1))
+            CALL iom_rp2d(1,1,inum,'aW',gcp(:,:,2))
+            CALL iom_rp2d(1,1,inum,'aE',gcp(:,:,3))
+            CALL iom_rp2d(1,1,inum,'aN',gcp(:,:,4))
+            CALL iom_rp2d(1,1,inum,'hu',hu(:,:))
+            CALL iom_rp2d(1,1,inum,'hv',hv(:,:))
+            CALL iom_rp2d(1,1,inum,'spgu',spgu(:,:))
+            CALL iom_rp2d(1,1,inum,'spgv',spgv(:,:))
+            CALL iom_rp2d(1,1,inum,'mask',bmask(:,:))
+            CALL iom_rp2d(1,1,inum,'solution',gcx(:,:))
+            CALL iom_rp2d(1,1,inum,'residual',gcr(:,:))
+            CALL iom_close(inum)
+         ELSE
+            ! SOLUTION WITH Petsc
+            CALL iom_open('sol_out_pet',inum,.TRUE.)
+            CALL iom_rp2d(1,1,inum,'rhs',gcb2(:,:))
+            CALL iom_rp2d(1,1,inum,'aD',gcdmat2(:,:))
+            CALL iom_rp2d(1,1,inum,'aS',gcp2(:,:,1))
+            CALL iom_rp2d(1,1,inum,'aW',gcp2(:,:,2))
+            CALL iom_rp2d(1,1,inum,'aE',gcp2(:,:,3))
+            CALL iom_rp2d(1,1,inum,'aN',gcp2(:,:,4))
+            CALL iom_rp2d(1,1,inum,'hu',hu(:,:))
+            CALL iom_rp2d(1,1,inum,'hv',hv(:,:))
+            CALL iom_rp2d(1,1,inum,'spgu',spgu(:,:))
+            CALL iom_rp2d(1,1,inum,'spgv',spgv(:,:))
+            CALL iom_rp2d(1,1,inum,'mask',bmask(:,:))
+            CALL iom_rp2d(1,1,inum,'solution',gcx_pet(:,:))
+            CALL iom_rp2d(1,1,inum,'residual',gcr2(:,:))
+            CALL iom_close(inum)
+         END IF
       END IF 
 
       CALL mpi_finalize(ierr)
@@ -1804,17 +1829,21 @@ CONTAINS
       !!----------------------------------------------------------------------
       ierr(:) = 0
       !
-      ALLOCATE( gcp (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj,4) ,     &
-         &      gcx (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj)   ,     &
-         &      gcxb(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj)   , STAT=ierr(1) )
+      ALLOCATE( gcp     (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj,4) ,     &
+         &      gcp2    (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj,4) ,     &
+         &      gcx     (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj)   ,     &
+         &      gcx_pet (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj)   ,     &
+         &      gcxb    (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj)   , STAT=ierr(1) )
 
       ALLOCATE( gcdprc(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     & 
          &      gcdmat(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     & 
          &      gcdmat2(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,    & 
          &      gcb   (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     &
+         &      gcb2  (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,     &
          &      zgc   (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) , STAT=ierr(2) )
 
       ALLOCATE( gcr  (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,   & 
+         &      gcr2 (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,   & 
          &      gcdes(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,   & 
          &      gccd (1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj) ,   &
          &      zaus(1-jpr2di:jpi+jpr2di,1-jpr2dj:jpj+jpr2dj,sstep) ,   &
@@ -1931,7 +1960,12 @@ CONTAINS
             gcp(ji,jj,2) =  zcoefw ! nn_gcp2
             gcp(ji,jj,3) =  zcoefe ! nn_gcp3
             gcp(ji,jj,4) =  zcoefn ! nn_gcp4
-      
+            
+            ! copy of coefficients for Petsc 
+            gcp2(ji,jj,1) =  zcoefs ! nn_gcp1
+            gcp2(ji,jj,2) =  zcoefw ! nn_gcp2
+            gcp2(ji,jj,3) =  zcoefe ! nn_gcp3
+            gcp2(ji,jj,4) =  zcoefn ! nn_gcp4
             !WRITE(6,*) 'ivano', 'gcp(',ji,',',jj,'1)', gcp(ji,jj,1)
             !WRITE(6,*) 'ivano', 'gcp(',ji,',',jj,'2)', gcp(ji,jj,2)
             !WRITE(6,*) 'ivano', 'gcp(',ji,',',jj,'3)', gcp(ji,jj,3)
@@ -2125,12 +2159,11 @@ CONTAINS
        
       1234 FORMAT(a3,i3,a1,i3,a3,e14.7,a3,i3,a1,i3,a3,e14.7)
 
-
       ! comment to avoid preconditioning   
-      !gcp(:,:,1) = gcp(:,:,1) * gcdprc(:,:)
-      !gcp(:,:,2) = gcp(:,:,2) * gcdprc(:,:)
-      !gcp(:,:,3) = gcp(:,:,3) * gcdprc(:,:)
-      !gcp(:,:,4) = gcp(:,:,4) * gcdprc(:,:)
+      gcp(:,:,1) = gcp(:,:,1) * gcdprc(:,:)
+      gcp(:,:,2) = gcp(:,:,2) * gcdprc(:,:)
+      gcp(:,:,3) = gcp(:,:,3) * gcdprc(:,:)
+      gcp(:,:,4) = gcp(:,:,4) * gcdprc(:,:)
       IF( nn_solv == 2 )  gccd(:,:) = rn_sor * gcp(:,:,2)
 
       !DO jj = 2, jpjm1                      ! matrix of free surface elliptic system
@@ -8316,44 +8349,52 @@ CONTAINS
 #     include "petsc/finclude/petscksp.h"
 #     include "petsc/finclude/petscpc.h"
 #     include "petsc/finclude/petscviewer.h"
+#     include "petsc/finclude/petscvec.h90"
 
-      PetscInt         vecsize,nnz, matnnz, vecnnz, N
-      PetscInt         matrows, matcols, vecrows, veccols
-      PetscInt         i,its,five, xsize, m, one, col_shift
-      PetscInt         ji,jj, ishift, jshift, nx, ny
-      PetscInt         cole, colw, coln, cols
-      PetscInt         LI, col5(5), col4(4), col3(3), row
-      PetscInt         nx_east , nx_west 
-      PetscInt         ny_south, ny_north 
-      PetscErrorCode   ierr
-      PetscBool        flg, print_out
-      PetscScalar      dot,ione, values5(5), values4(4), values3(3)
-      PetscReal        norm,rdot, zero, tol, minus_one
-      Vec              x,b,y
-      Mat              A
-      KSP              ksp
-      PC               pc
-      PetscMPIInt      rank, comm_size
-      PetscViewer      mview  ! DO NOT USE matview. IT LOOKS 
-                              ! LIKE IS A PRIVATE PETSC WORD
+      PetscInt       ::   vecsize,nnz, matnnz, vecnnz, N
+      PetscInt       ::   matrows, matcols, vecrows, veccols
+      PetscInt       ::   i,its, xsize, m, one, col_shift
+      PetscInt       ::   three, four, five, two
+      PetscInt       ::   ji,jj, ishift, jshift, nx, ny
+      PetscInt       ::   LI, col5(5), col4(4), col3(3), row
+      PetscInt       ::   nx_east , nx_west 
+      PetscInt       ::   ny_south, ny_north, low, high 
+      PetscErrorCode ::   ierr
+      PetscBool      ::   flg, print_out
+      PetscScalar    ::   dot,ione, values5(5), values4(4), values3(3)
+      PetscReal      ::   norm,rdot, zero, tol, minus_one
+      Vec            ::   x,b,residual
+      Mat            ::   A
+      KSP            ::   ksp
+      PC             ::   pc
+      PetscScalar, pointer ::  xx_v(:), rr_v(:)
+      PetscOffset    ::   xx_i
+      PetscMPIInt    ::   rank, comm_size
+      PetscViewer    ::   vview
+      PetscViewer    ::   mview  ! DO NOT USE matview. IT LOOKS 
+                                 ! LIKE IS A PRIVATE PETSC WORD
 
+      REAL(wp) :: alloc_time, inn_dom_time, borders_time
 
       CALL PetscInitialize( PETSC_NULL_CHARACTER ,ierr)
+      !CALL PetscInitialize( mpi_comm_opa ,ierr)
       !CALL mpi_comm_rank( mpi_comm_opa, mpprank, ierr )
       !CALL mpi_comm_size( mpi_comm_opa, mppsize, ierr )
 
       five  = 5
       four  = 4
       three = 3
+      two   = 2
       one   = 1
+      minus_one = -1.0
 
       IF ( mpprank == rank_print ) PRINT '(a,i3,a)',' <-using sol_petsc  >' 
 
       ! global dimension of matrix
       N = jpiglo * jpjglo 
       ! # of local rows of matrix
-      nx = nlei - nldi + 1
-      ny = nlej - nldj + 1
+      nx = nx_self(mpprank+1)
+      ny = ny_self(mpprank+1)
 
       m = nx * ny
 
@@ -8367,67 +8408,79 @@ CONTAINS
 
       CALL MatCreate( mpi_comm_opa,A,ierr)
       CALL MatSetSizes(A,m,m,N,N,ierr)
-      !CALL MatSetSizes(A,PETSC_DECIDE,PETSC_DECIDE,N,N,ierr)
       CALL MatSetType(A, MATMPIAIJ,ierr)
       CALL MatSetFromOptions(A,ierr)
-      CALL MatMPIAIJSetPreallocation(A,five,PETSC_NULL_INTEGER,five,PETSC_NULL_INTEGER,ierr)
+
+      CALL MatMPIAIJSetPreallocation(A,five,PETSC_NULL_INTEGER,two,PETSC_NULL_INTEGER,ierr)
 
       !CALL MatGetSize     (A, glob_r, glob_c, ierr)
       !CALL MatGetLocalSize(A, loc_r, loc_c, ierr)
 
-      ! BORDERS ARE TREATED LATER
+      911 FORMAT(a6,2i5,a5,i6,a6,5i6)
+      912 FORMAT(a6,2i5,a5,i6,a6,4i6)
+      913 FORMAT(a6,2i5,a5,i6,a6,3i6)
+      !! --------------------------------------- !!
+      !!    TREATING INSIDE OF INNER DOMAINS     !!
+      !! (BORDERS AND CORNERS ARE TREATED LATER) !!
+      !! --------------------------------------- !!
       DO jj = nldj+1, nlej-1
          DO ji = nldi+1, nlei-1
             LI = (jj-1-jshift)*nx + ji-ishift
             row = RB(mpprank+1) + LI - 1
             col5(1)    = row - nx      ! south
-            values5(1) = gcp(ji,jj,1)     
+            values5(1) = gcp2(ji,jj,1)     
             col5(2)    = row - 1       ! west
-            values5(2) = gcp(ji,jj,2) 
+            values5(2) = gcp2(ji,jj,2) 
             col5(3)    = row           ! diag
             values5(3) = gcdmat2(ji,jj) 
             col5(4)    = row + 1       ! east
-            values5(4) = gcp(ji,jj,3) 
+            values5(4) = gcp2(ji,jj,3) 
             col5(5)    = row + nx      ! north
-            values5(5) = gcp(ji,jj,4) 
-            !WRITE(6,*) ji,jj, col(:)
-            !CALL MatSetValue(A,RB+LI-1,RB+LI-1, gcdmat2(ji,jj), INSERT_VALUES, ierr) 
-            CALL MatSetValues(A,one,row,five,col, values, INSERT_VALUES, ierr) 
+            values5(5) = gcp2(ji,jj,4)
+            !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+            CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
          END DO
       END DO
 
-      ! TREATING BORDERS ( WITHOUT CORNERS )
+      !! ------------------------------------ !!
+      !! TREATING BORDERS ( WITHOUT CORNERS ) !!
+      !! ------------------------------------ !!
+
       ! < EAST BORDER >
       IF ( someone_east(mpprank+1) == .TRUE. ) THEN
          ji = nlei ! eastern col
          DO jj = nldj+1,nlej-1
-            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            LI = (jj-1-jshift)*nx + ji-ishift
             row  = RB(mpprank+1) + LI - 1
             col5(1)    = row - nx                       ! south
-            values5(1) = gcp(ji,jj,1)     
+            values5(1) = gcp2(ji,jj,1)     
             col5(2)    = row - 1                        ! west
-            values5(2) = gcp(ji,jj,2) 
+            values5(2) = gcp2(ji,jj,2) 
             col5(3)    = row                            ! diag
             values5(3) = gcdmat2(ji,jj) 
             col5(4)    = row + col_shift_east(jj)       ! east
-            values5(4) = gcp(ji,jj,3) 
+            values5(4) = gcp2(ji,jj,3) 
             col5(5)    = row + nx                       ! north
-            values5(5) = gcp(ji,jj,4) 
-            !CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+            values5(5) = gcp2(ji,jj,4) 
+            !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+            CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
          END DO
       ELSE
+         ! EASTERN EDGE OF GLOBAL DOMAIN
+         ji = nlei ! eastern col
          DO jj = nldj+1,nlej-1
-            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            LI = (jj-1-jshift)*nx + ji-ishift
             row  = RB(mpprank+1) + LI - 1
             col4(1)    = row - nx                       ! south
-            values4(1) = gcp(ji,jj,1)     
+            values4(1) = gcp2(ji,jj,1)     
             col4(2)    = row - 1                        ! west
-            values4(2) = gcp(ji,jj,2) 
+            values4(2) = gcp2(ji,jj,2) 
             col4(3)    = row                            ! diag
             values4(3) = gcdmat2(ji,jj) 
             col4(4)    = row + nx                       ! north
-            values4(4) = gcp(ji,jj,4) 
-            !CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+            values4(4) = gcp2(ji,jj,4) 
+            !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+            CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
          END DO  
       END IF
 
@@ -8435,11 +8488,37 @@ CONTAINS
       IF ( someone_west(mpprank+1) == .TRUE. ) THEN
          ji = nldi ! western col
          DO jj = nldj+1,nlej-1
-            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            LI = (jj-1-jshift)*nx + ji-ishift
             row  = RB(mpprank+1) + LI - 1
-            colw = row - col_shift_west(jj)
-            !WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'west_point',RB(mpprank+1)+LI-col_shift_west(jj) 
-            CALL MatSetValue(A,row,colw, gcp(ji,jj,2), INSERT_VALUES, ierr) 
+            col5(1)    = row - nx                       ! south
+            values5(1) = gcp2(ji,jj,1)     
+            col5(2)    = row - col_shift_west(jj)       ! west
+            values5(2) = gcp2(ji,jj,2) 
+            col5(3)    = row                            ! diag
+            values5(3) = gcdmat2(ji,jj) 
+            col5(4)    = row + 1                        ! east
+            values5(4) = gcp2(ji,jj,3) 
+            col5(5)    = row + nx                       ! north
+            values5(5) = gcp2(ji,jj,4) 
+            !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+            CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+         END DO  
+      ELSE
+         ! WESTERN EDGE OF GLOBAL DOMAIN 
+         ji = nldi ! western col
+         DO jj = nldj+1,nlej-1
+            LI  = (jj-1-jshift)*nx + ji-ishift
+            row = RB(mpprank+1) + LI - 1
+            col4(1)    = row - nx                       ! south
+            values4(1) = gcp2(ji,jj,1)     
+            col4(2)    = row                            ! diag
+            values4(2) = gcdmat2(ji,jj) 
+            col4(3)    = row + 1                        ! east
+            values4(3) = gcp2(ji,jj,3) 
+            col4(4)    = row + nx                       ! north
+            values4(4) = gcp2(ji,jj,4) 
+            !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+            CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
          END DO  
       END IF
  
@@ -8447,11 +8526,37 @@ CONTAINS
       IF ( someone_north(mpprank+1) == .TRUE. ) THEN
          jj = nlej ! northern row
          DO ji = nldi+1, nlei-1
-            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            LI = (jj-1-jshift)*nx + ji-ishift
             row  = RB(mpprank+1) + LI - 1
-            coln = row + col_shift_north(ji)
-            !WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'north_point', RB(mpprank+1)+LI+col_shift_north(ji) 
-            CALL MatSetValue(A,row,coln, gcp(ji,jj,4), INSERT_VALUES, ierr) 
+            col5(1)    = row - nx                       ! south
+            values5(1) = gcp2(ji,jj,1)     
+            col5(2)    = row - 1                        ! west
+            values5(2) = gcp2(ji,jj,2) 
+            col5(3)    = row                            ! diag
+            values5(3) = gcdmat2(ji,jj) 
+            col5(4)    = row + 1                        ! east
+            values5(4) = gcp2(ji,jj,3) 
+            col5(5)    = row + col_shift_north(ji)      ! north
+            values5(5) = gcp2(ji,jj,4) 
+            !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+            CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+         END DO
+      ELSE
+         ! NORTHERN EDGE OF DOMAIN
+         jj = nlej ! northern row
+         DO ji = nldi+1, nlei-1
+            LI = (jj-1-jshift)*nx + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            col4(1)    = row - nx                       ! south
+            values4(1) = gcp2(ji,jj,1)    
+            col4(2)    = row - 1                        ! west
+            values4(2) = gcp2(ji,jj,2)                
+            col4(3)    = row                            ! diag
+            values4(3) = gcdmat2(ji,jj)
+            col4(4)    = row + 1                        ! east
+            values4(4) = gcp2(ji,jj,3)
+            !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+            CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
          END DO
       END IF
 
@@ -8459,24 +8564,334 @@ CONTAINS
       IF ( someone_south(mpprank+1) == .TRUE. ) THEN
          jj = nldj ! southern row
          DO ji = nldi+1, nlei-1
-            LI = (jj-1-jshift)*nx_self(mpprank+1) + ji-ishift
+            LI = (jj-1-jshift)*nx + ji-ishift
             row  = RB(mpprank+1) + LI - 1
-            cols = row - col_shift_south(ji)
-            !WRITE(6,*) ji,jj, RB(mpprank+1)+LI, 'south_point', RB(mpprank+1)+LI-col_shift_south(ji) 
-            CALL MatSetValue(A,row,cols, gcp(ji,jj,1), INSERT_VALUES, ierr) 
+            col5(1)    = row - col_shift_south(ji)      ! south
+            values5(1) = gcp2(ji,jj,1)     
+            col5(2)    = row - 1                        ! west
+            values5(2) = gcp2(ji,jj,2) 
+            col5(3)    = row                            ! diag
+            values5(3) = gcdmat2(ji,jj) 
+            col5(4)    = row + 1                        ! east
+            values5(4) = gcp2(ji,jj,3) 
+            col5(5)    = row + nx                       ! north
+            values5(5) = gcp2(ji,jj,4) 
+            !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+            CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+         END DO
+      ELSE
+         ! SOUTHERN EDGE OF GLOBAL DOMAIN
+         jj = nldj ! southern row
+         DO ji = nldi+1, nlei-1
+            LI = (jj-1-jshift)*nx + ji-ishift
+            row  = RB(mpprank+1) + LI - 1
+            col4(1)    = row - 1                        ! west
+            values4(1) = gcp2(ji,jj,2)                
+            col4(2)    = row                            ! diag
+            values4(2) = gcdmat2(ji,jj)
+            col4(3)    = row + 1                        ! east
+            values4(3) = gcp2(ji,jj,3)
+            col4(4)    = row + nx                       ! north
+            values4(4) = gcp2(ji,jj,4)
+            !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+            CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
          END DO
       END IF
+     
+      !! -----------------!!
+      !! TREATING CORNERS !!
+      !! -----------------!!
 
-      ! TREATING CORNERS
+      ! < SOUTH-WEST CORNER >
+      ji = nldi
+      jj = nldj
+      LI = (jj-1-jshift)*nx + ji-ishift
+      row  = RB(mpprank+1) + LI - 1
+      IF ( someone_south(mpprank+1) == .TRUE. .AND. someone_west(mpprank+1) == .TRUE. ) THEN
+         col5(1)    = row - col_shift_south(ji)      ! south
+         values5(1) = gcp2(ji,jj,1)     
+         col5(2)    = row - col_shift_west(jj)       ! west
+         values5(2) = gcp2(ji,jj,2) 
+         col5(3)    = row                            ! diag
+         values5(3) = gcdmat2(ji,jj) 
+         col5(4)    = row + 1                        ! east
+         values5(4) = gcp2(ji,jj,3) 
+         col5(5)    = row + nx                       ! north
+         values5(5) = gcp2(ji,jj,4) 
+         !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+         CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_south(mpprank+1) == .TRUE. .AND. someone_west(mpprank+1) == .FALSE. ) THEN
+         col4(1)    = row - col_shift_south(ji)      ! south
+         values4(1) = gcp2(ji,jj,1)     
+         col4(2)    = row                            ! diag
+         values4(2) = gcdmat2(ji,jj) 
+         col4(3)    = row + 1                        ! east
+         values4(3) = gcp2(ji,jj,3) 
+         col4(4)    = row + nx                       ! north
+         values4(4) = gcp2(ji,jj,4) 
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_south(mpprank+1) == .FALSE. .AND. someone_west(mpprank+1) == .TRUE. ) THEN
+         col4(1)    = row - col_shift_west(jj)       ! west
+         values4(1) = gcp2(ji,jj,2)                
+         col4(2)    = row                            ! diag
+         values4(2) = gcdmat2(ji,jj)
+         col4(3)    = row + 1                        ! east
+         values4(3) = gcp2(ji,jj,3)
+         col4(4)    = row + nx                       ! north
+         values4(4) = gcp2(ji,jj,4) 
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE ! there isn't any process either at south or west 
+         col3(1)    = row + 1                        ! east
+         values3(1) = gcp2(ji,jj,3)       
+         col3(2)    = row                            ! diag
+         values3(2) = gcdmat2(ji,jj)
+         col3(3)    = row + nx                       ! north
+         values3(3) = gcp2(ji,jj,4) 
+         !WRITE(6,913) 'ji ,jj' ,ji, jj, 'row', row,'col3 ', col3
+         CALL MatSetValues(A,one,row,three,col3, values3, INSERT_VALUES, ierr) 
+      END IF
+
+      ! < SOUTH-EAST CORNER >
+      ji = nlei
+      jj = nldj
+      LI = (jj-1-jshift)*nx + ji-ishift
+      row  = RB(mpprank+1) + LI - 1
+      IF ( someone_south(mpprank+1) == .TRUE. .AND. someone_east(mpprank+1) == .TRUE. ) THEN
+         col5(1)    = row - col_shift_south(ji)      ! south
+         values5(1) = gcp2(ji,jj,1)     
+         col5(2)    = row - 1                        ! west
+         values5(2) = gcp2(ji,jj,2) 
+         col5(3)    = row                            ! diag
+         values5(3) = gcdmat2(ji,jj) 
+         col5(4)    = row + col_shift_east(jj)       ! east
+         values5(4) = gcp2(ji,jj,3) 
+         col5(5)    = row + nx                       ! north
+         values5(5) = gcp2(ji,jj,4) 
+         !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+         CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_south(mpprank+1) == .TRUE. .AND. someone_east(mpprank+1) == .FALSE. ) THEN
+         col4(1)    = row - col_shift_south(ji)      ! south
+         values4(1) = gcp2(ji,jj,1)     
+         col4(2)    = row - 1                        ! west
+         values4(2) = gcp2(ji,jj,2) 
+         col4(3)    = row                            ! diag
+         values4(3) = gcdmat2(ji,jj) 
+         col4(4)    = row + nx                       ! north
+         values4(4) = gcp2(ji,jj,4) 
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_south(mpprank+1) == .FALSE. .AND. someone_east(mpprank+1) == .TRUE. ) THEN
+         col4(1)    = row - 1                        ! west
+         values4(1) = gcp2(ji,jj,2)                
+         col4(2)    = row                            ! diag
+         values4(2) = gcdmat2(ji,jj)
+         col4(3)    = row + col_shift_east(jj)       ! east
+         values4(3) = gcp2(ji,jj,3)
+         col4(4)    = row + nx                       ! north
+         values4(4) = gcp2(ji,jj,4)
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE
+         col3(1)    = row - 1                        ! west
+         values3(1) = gcp2(ji,jj,2)
+         col3(2)    = row                            ! diag
+         values3(2) = gcdmat2(ji,jj)
+         col3(3)    = row + nx                       ! north
+         values3(3) = gcp2(ji,jj,4)
+         !WRITE(6,913) 'ji ,jj' ,ji, jj, 'row', row,'col3 ', col3
+         CALL MatSetValues(A,one,row,three,col3, values3, INSERT_VALUES, ierr) 
+      END IF
+
+      ! < NORTH-WEST CORNER > 
+      ji = nldi
+      jj = nlej
+      LI = (jj-1-jshift)*nx + ji-ishift
+      row  = RB(mpprank+1) + LI - 1
+      IF ( someone_north(mpprank+1) == .TRUE. .AND. someone_west(mpprank+1) == .TRUE. ) THEN
+         col5(1)    = row - nx                       ! south
+         values5(1) = gcp2(ji,jj,1)     
+         col5(2)    = row - col_shift_west(jj)       ! west
+         values5(2) = gcp2(ji,jj,2) 
+         col5(3)    = row                            ! diag
+         values5(3) = gcdmat2(ji,jj) 
+         col5(4)    = row + 1                        ! east
+         values5(4) = gcp2(ji,jj,3) 
+         col5(5)    = row + col_shift_north(ji)      ! north
+         values5(5) = gcp2(ji,jj,4) 
+         !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+         CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_north(mpprank+1) == .FALSE. .AND. someone_west(mpprank+1) == .TRUE. ) THEN
+         col4(1)    = row - nx                       ! south
+         values4(1) = gcp2(ji,jj,1)    
+         col4(2)    = row - col_shift_west(jj)       ! west
+         values4(2) = gcp2(ji,jj,2)                
+         col4(3)    = row                            ! diag
+         values4(3) = gcdmat2(ji,jj)
+         col4(4)    = row + 1                        ! east
+         values4(4) = gcp2(ji,jj,3)
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_north(mpprank+1) == .TRUE. .AND. someone_west(mpprank+1) == .FALSE. ) THEN
+         col4(1)    = row - nx                       ! south
+         values4(1) = gcp2(ji,jj,1)     
+         col4(2)    = row                            ! diag
+         values4(2) = gcdmat2(ji,jj) 
+         col4(3)    = row + 1                        ! east
+         values4(3) = gcp2(ji,jj,3) 
+         col4(4)    = row + col_shift_north(ji)      ! north
+         values4(4) = gcp2(ji,jj,4) 
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE
+         col3(1)    = row - nx                       ! south                        
+         values3(1) = gcp2(ji,jj,2)
+         col3(2)    = row                            ! diag
+         values3(2) = gcdmat2(ji,jj)
+         col3(3)    = row + 1                        ! east
+         values3(3) = gcp2(ji,jj,4)
+         !WRITE(6,913) 'ji ,jj' ,ji, jj, 'row', row,'col3 ', col3
+         CALL MatSetValues(A,one,row,three,col3, values3, INSERT_VALUES, ierr) 
+      END IF
+
+      ! < NORTH-EAST CORNER >
+      ji = nlei
+      jj = nlej
+      LI = (jj-1-jshift)*nx + ji-ishift
+      row  = RB(mpprank+1) + LI - 1
+      IF ( someone_north(mpprank+1) == .TRUE. .AND. someone_east(mpprank+1) == .TRUE. ) THEN
+         col5(1)    = row - nx                       ! south
+         values5(1) = gcp2(ji,jj,1)     
+         col5(2)    = row - 1                        ! west
+         values5(2) = gcp2(ji,jj,2) 
+         col5(3)    = row                            ! diag
+         values5(3) = gcdmat2(ji,jj) 
+         col5(4)    = row + col_shift_east(jj)       ! east
+         values5(4) = gcp2(ji,jj,3) 
+         col5(5)    = row + col_shift_north(ji)      ! north
+         values5(5) = gcp2(ji,jj,4) 
+         !WRITE(6,911) 'ji ,jj' ,ji, jj, 'row', row,'col5 ', col5
+         CALL MatSetValues(A,one,row,five,col5, values5, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_north(mpprank+1) == .TRUE. .AND. someone_east(mpprank+1) == .FALSE. ) THEN
+         col4(1)    = row - nx                       ! south
+         values4(1) = gcp2(ji,jj,1)     
+         col4(2)    = row - 1                        ! west
+         values4(2) = gcp2(ji,jj,2) 
+         col4(3)    = row                            ! diag
+         values4(3) = gcdmat2(ji,jj) 
+         col4(4)    = row + col_shift_north(ji)      ! north
+         values4(4) = gcp2(ji,jj,4) 
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE IF ( someone_north(mpprank+1) == .FALSE. .AND. someone_east(mpprank+1) == .TRUE. ) THEN
+         col4(1)    = row - nx                       ! south
+         values4(1) = gcp2(ji,jj,1)    
+         col4(2)    = row - 1                        ! west
+         values4(2) = gcp2(ji,jj,2)                
+         col4(3)    = row                            ! diag
+         values4(3) = gcdmat2(ji,jj)
+         col4(4)    = row + col_shift_east(jj)       ! east
+         values4(4) = gcp2(ji,jj,3)
+         !WRITE(6,912) 'ji ,jj' ,ji, jj, 'row', row,'col4 ', col4
+         CALL MatSetValues(A,one,row,four,col4, values4, INSERT_VALUES, ierr) 
+      ELSE
+         col3(1)    = row - nx                       ! south
+         values3(1) = gcp2(ji,jj,1)
+         col3(2)    = row                            ! diag
+         values3(2) = gcdmat2(ji,jj)  
+         col3(3)    = row - 1                        ! west
+         values3(3) = gcp2(ji,jj,2)
+         !WRITE(6,913) 'ji ,jj' ,ji, jj, 'row', row,'col3 ', col3
+         CALL MatSetValues(A,one,row,three,col3, values3, INSERT_VALUES, ierr) 
+      END IF
 
       CALL MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY,ierr)
       CALL MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY,ierr)
 
-      CALL PetscViewerASCIIOpen( mpi_comm_opa ,'ORCA2_MAT',mview,ierr)
-      CALL MatView(A,mview,ierr)
-      CALL PetscViewerDestroy(mview,ierr)
+      ! < RIGHT HAND SIDE >
+      CALL VecCreate( mpi_comm_opa, b, ierr)
+      CALL VecSetSizes(b, m, N, ierr)
+      CALL VecSetFromOptions(b,ierr)
 
-      CALL MatDestroy(A,ierr)
+      DO jj = nldj, nlej
+         DO ji = nldi, nlei
+            LI = (jj-1-jshift)*nx + ji-ishift
+            row = RB(mpprank+1) + LI - 1
+            CALL VecSetValue(b,row,gcb2(ji,jj),INSERT_VALUES,ierr)
+         END DO
+      END DO
+
+      CALL VecAssemblyBegin(b,ierr)
+      CALL VecAssemblyEnd(b,ierr)
+
+      CALL VecGetOwnershipRange(b, low,high,ierr)
+      WRITE(6,*) 'low ', low, 'high ', high
+
+      ! < SOLUTION INIT >
+      CALL VecDuplicate(b, x       , ierr)
+      CALL VecDuplicate(b, residual, ierr)
+
+      !CALL PetscViewerASCIIOpen( mpi_comm_opa ,'ORCA2_MAT',mview,ierr)
+      !CALL MatView(A,mview,ierr)
+      !CALL PetscViewerDestroy(mview,ierr)
+
+      !CALL PetscViewerASCIIOpen( mpi_comm_opa ,'ORCA2_RHS',vview,ierr)
+      !CALL VecView(b,vview,ierr)
+      !CALL PetscViewerDestroy(vview,ierr)
+      
+      CALL KSPCreate( mpi_comm_opa, ksp, ierr)
+      CALL KSPSetOperators(ksp, A, A, ierr)
+      CALL KSPSetFromOptions(ksp, ierr)
+      CALL KSPSolve(ksp, b, x, ierr)
+      CALL KSPGetIterationNumber(ksp, its, ierr)
+ 
+      WRITE(6,*) 'iterations ', its
+
+      !CALL PetscViewerASCIIOpen( mpi_comm_opa ,'ORCA2_PETSC_SOLU',vview,ierr)
+      !CALL VecView(x,vview,ierr)
+      !CALL PetscViewerDestroy(vview,ierr)
+
+      ! < RETURN SOLUTION TO NEMO >
+      CALL VecGetArrayReadF90(x,xx_v,ierr)
+
+      DO jj = nldj, nlej
+         DO ji = nldi, nlei
+            LI = (jj-1-jshift)*nx + ji-ishift
+            !row = RB(mpprank+1) + LI - 1
+            row = LI - 1
+            !WRITE(6,'(a3,i5,a3,i5,a5,i6)') 'ji',ji,'jj',jj,'row',row
+            gcx_pet(ji,jj) = xx_v(row+1)      
+         END DO
+      END DO
+
+      CALL VecRestoreArrayReadF90(x,xx_v,ierr)
+
+      ! < CALCULATE RESIDUAL >
+      CALL MatMult(A,x,residual,ierr)             ! residual = A * x
+      CALL VecAYPX(residual, minus_one, b, ierr)  ! residual = b - 1 * residual 
+
+      CALL VecNorm(residual,NORM_2,norm,ierr)
+    
+      IF ( mpprank == 0 ) WRITE(6,*) 'norm of residual: ', norm
+
+      CALL VecGetArrayReadF90(residual,rr_v,ierr)
+
+      DO jj = nldj, nlej
+         DO ji = nldi, nlei
+            LI = (jj-1-jshift)*nx + ji-ishift
+            !row = RB(mpprank+1) + LI - 1
+            row = LI - 1
+            gcr2(ji,jj) = rr_v(row+1)      
+         END DO
+      END DO
+
+      CALL VecRestoreArrayReadF90(residual,rr_v,ierr)
+
+      CALL MatDestroy(A, ierr)
+      CALL VecDestroy(b, ierr)
+      CALL VecDestroy(x, ierr)
+      CALL VecDestroy(residual, ierr)
       CALL PetscFinalize(ierr)
 
    END SUBROUTINE sol_petsc
